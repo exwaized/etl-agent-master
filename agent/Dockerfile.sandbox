@@ -1,0 +1,7 @@
+FROM python:3.12-slim
+
+# Pin these to match requirements.txt so validation runs against the
+# same library versions the real pipeline uses. Update both together.
+RUN pip install --no-cache-dir pandas==2.2.2
+
+WORKDIR /sandbox
