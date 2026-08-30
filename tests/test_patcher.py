@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.patcher import apply_patch_to_source, PatchApplyError
+from agent.patcher import apply_patch_to_source, build_runtime_function, PatchApplyError
 
 
 def _load_module(path: Path, name: str):
@@ -161,3 +161,26 @@ def test_missing_source_file_raises_cleanly():
     fn = eval("lambda df: df")
     with pytest.raises(PatchApplyError):
         apply_patch_to_source(fn, "lambda df: df")
+
+
+def test_runtime_patch_updates_the_original_closure_state(tmp_path):
+    src = tmp_path / "runtime_mod.py"
+    src.write_text(
+        "def build_steps():\n"
+        "    state = {'value': 1}\n"
+        "\n"
+        "    def step():\n"
+        "        state['value'] = 0\n"
+        "\n"
+        "    return step, state\n"
+    )
+    mod = _load_module(src, "runtime_mod")
+    step, state = mod.build_steps()
+
+    patched = build_runtime_function(
+        step,
+        "def step():\n    state['value'] = 42\n",
+    )
+    patched()
+
+    assert state == {'value': 42}

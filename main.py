@@ -1,5 +1,6 @@
 import inspect
 import re
+import traceback
 import uuid
 import logging
 from pathlib import Path
@@ -14,7 +15,7 @@ from agent.classifier import classify
 from agent.llm import suggest_fix
 from agent.sandbox import run_patch
 from agent.validator import validate_patch
-from agent.patcher import apply_patch_to_source, PatchApplyError
+from agent.patcher import apply_patch_to_source, build_runtime_function, PatchApplyError
 from agent.escalate import alert
 from pipelines.sample_pipeline import build_steps, CSV_PATH
 
@@ -101,7 +102,7 @@ def handle_step(name: str, fn, state: dict, attempt: int = 1, previous_attempt_f
         # the system prompt, original source, data context, and feedback.
         # The last few frames (the actual user code that failed) carry all
         # the diagnostic value; the deep pandas/numpy frames are noise.
-        raw_context = str(exc.__cause__.__traceback__) if exc.__cause__ else None
+        raw_context = "".join(traceback.format_exception(exc.__cause__)) if exc.__cause__ else None
         truncated_context = raw_context[-500:] if raw_context else None
 
         try:
@@ -114,7 +115,7 @@ def handle_step(name: str, fn, state: dict, attempt: int = 1, previous_attempt_f
                 previous_attempt_feedback=previous_attempt_feedback,
             )
             log.info("diagnosis: %s", suggestion.diagnosis)
-        except (ValueError, Exception) as llm_exc:
+        except Exception as llm_exc:
             log.warning("LLM call failed, treating as failed generation: %s", llm_exc)
             suggestion = None
 
@@ -134,23 +135,39 @@ def handle_step(name: str, fn, state: dict, attempt: int = 1, previous_attempt_f
                     _EXPECTED_OUTPUT_COLUMNS, _NUMERIC_OUTPUT_COLUMNS,
                 )
                 if validation.ok:
-                    _persist_patch(fn, suggestion.code_patch, failure_id, suggestion.diagnosis)
-                    log.info("patch validated end-to-end and applied: %s", validation.reason)
-                    return True
-                log.warning("patch rejected at validation: %s | %s",
-                            validation.reason, str(validation.detail)[:300])
-                # This is the actual fix for the "retries have no memory" gap:
-                # without this, every retry re-diagnoses the ORIGINAL error from
-                # scratch (since nothing was ever persisted) and tends to propose
-                # roughly the same kind of fix, hitting the same secondary wall
-                # every time. Telling the model exactly why its last attempt was
-                # rejected turns retry 2 into an informed correction instead of
-                # a second independent guess.
-                next_feedback = (
-                    f"Your previous patch was rejected during validation: {validation.reason}. "
-                    f"Detail: {str(validation.detail)[:300]}. "
-                    f"Propose a DIFFERENT fix that specifically avoids this problem."
-                )
+                    try:
+                        runtime_fn = build_runtime_function(fn, suggestion.code_patch)
+                        # Execute the validated replacement against the live
+                        # closure/state before treating this step as repaired.
+                        # Without this, a successful sandbox candidate was
+                        # checkpointed while the failed in-memory function had
+                        # never changed or run.
+                        run_step(name, runtime_fn)
+                    except (PatchApplyError, RuntimeError) as runtime_exc:
+                        log.warning("validated patch failed in the live pipeline: %s", runtime_exc)
+                        next_feedback = (
+                            "Your patch passed isolated validation but failed when applied to the live "
+                            f"step: {runtime_exc}. Propose a different fix that avoids this problem."
+                        )
+                    else:
+                        _persist_patch(fn, suggestion.code_patch, failure_id, suggestion.diagnosis)
+                        log.info("patch validated and executed live: %s", validation.reason)
+                        return True
+                else:
+                    log.warning("patch rejected at validation: %s | %s",
+                                validation.reason, str(validation.detail)[:300])
+                    # This is the actual fix for the "retries have no memory" gap:
+                    # without this, every retry re-diagnoses the ORIGINAL error from
+                    # scratch (since nothing was ever persisted) and tends to propose
+                    # roughly the same kind of fix, hitting the same secondary wall
+                    # every time. Telling the model exactly why its last attempt was
+                    # rejected turns retry 2 into an informed correction instead of
+                    # a second independent guess.
+                    next_feedback = (
+                        f"Your previous patch was rejected during validation: {validation.reason}. "
+                        f"Detail: {str(validation.detail)[:300]}. "
+                        f"Propose a DIFFERENT fix that specifically avoids this problem."
+                    )
 
         if attempt < MAX_ATTEMPTS:
             log.warning("patch failed, retrying (%d/%d)", attempt + 1, MAX_ATTEMPTS)

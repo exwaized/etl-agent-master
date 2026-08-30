@@ -79,6 +79,43 @@ def merge_patch(original_block: str, patch_code: str) -> str:
     return f"{signature_line}\n{reindented_body}\n"
 
 
+def build_runtime_function(fn, patch_code: str):
+    """Build a patched version of ``fn`` that shares its live closure state.
+
+    Validation proves a patch works in a disposable container, but the
+    pipeline also needs to execute that same patch before it can checkpoint
+    the repaired step.  Nested pipeline steps close over objects such as the
+    shared ``state`` dict.  A normal ``exec`` would lose that closure, so
+    expose each closed-over value in the execution namespace.  The generated
+    function then updates the very same objects as the failed function.
+
+    This does not mutate the original function or source file; callers can
+    still choose whether to promote the separately persisted patch.
+    """
+    try:
+        original_block = inspect.getsource(fn)
+    except OSError as exc:
+        raise PatchApplyError(f"no source available for {fn.__name__}: {exc}") from exc
+
+    patched_source = textwrap.dedent(merge_patch(original_block, patch_code))
+    namespace = dict(fn.__globals__)
+    if fn.__closure__:
+        namespace.update({
+            name: cell.cell_contents
+            for name, cell in zip(fn.__code__.co_freevars, fn.__closure__)
+        })
+
+    try:
+        exec(compile(patched_source, f"<runtime patch for {fn.__name__}>", "exec"), namespace)
+    except Exception as exc:
+        raise PatchApplyError(f"could not build runtime patch for {fn.__name__}: {exc}") from exc
+
+    patched_fn = namespace.get(fn.__name__)
+    if not callable(patched_fn):
+        raise PatchApplyError(f"runtime patch did not define callable {fn.__name__}")
+    return patched_fn
+
+
 class PatchApplyError(Exception):
     """Raised when a patch can't be safely written back to its source file.
 
